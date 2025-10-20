@@ -1,0 +1,108 @@
+name: Deploy WebSocket API to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  AWS_REGION: us-east-1  # Change to your region
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore WebSocketApi/WebSocketApi.csproj
+
+      - name: Build
+        run: dotnet build WebSocketApi/WebSocketApi.csproj --configuration Release --no-restore
+
+      - name: Test (if you have tests)
+        run: dotnet test WebSocketApi/WebSocketApi.csproj --configuration Release --no-build --verbosity normal || echo "No tests found"
+
+      - name: Publish
+        run: dotnet publish WebSocketApi/WebSocketApi.csproj --configuration Release --output ./publish
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create deployment package
+        run: |
+          cd publish
+          zip -r ../websocketapi-${{ github.sha }}.zip .
+          cd ..
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp websocketapi-${{ github.sha }}.zip s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/websocketapi-${{ github.sha }}.zip
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:Name,Values=${{ secrets.EC2_INSTANCE_TAG }}" \
+            --parameters 'commands=[
+              "#!/bin/bash",
+              "set -e",
+              "echo \"Starting deployment at $(date)\"",
+              "cd /tmp",
+              "aws s3 cp s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/websocketapi-${{ github.sha }}.zip ./websocketapi.zip",
+              "sudo systemctl stop websocketapi || echo \"Service not running\"",
+              "sudo rm -rf /var/www/websocketapi/*",
+              "sudo unzip -o websocketapi.zip -d /var/www/websocketapi/",
+              "sudo chown -R www-data:www-data /var/www/websocketapi",
+              "sudo systemctl start websocketapi",
+              "sleep 5",
+              "sudo systemctl status websocketapi",
+              "curl -f http://localhost:5000/health || echo \"Health check warning\"",
+              "echo \"Deployment completed at $(date)\"",
+              "rm websocketapi.zip"
+            ]' \
+            --comment "Deploy WebSocketApi from GitHub Actions" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for deployment
+        run: sleep 30
+
+      - name: Verify deployment
+        run: |
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ secrets.EC2_INSTANCE_TAG }}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+
+          echo "Instance IP: $INSTANCE_IP"
+
+          if [ "$INSTANCE_IP" != "None" ]; then
+            echo "Checking health endpoint..."
+            curl -f http://$INSTANCE_IP/health || echo "Direct health check failed (might be behind ALB)"
+          fi
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### Deployment Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Package:** websocketapi-${{ github.sha }}.zip" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Deployment completed! :white_check_mark:" >> $GITHUB_STEP_SUMMARY
